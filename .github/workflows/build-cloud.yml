@@ -33,11 +33,9 @@ jobs:
       - name: Choose boot JDK version
         id: boot
         run: |
-          if [ "${{ matrix.version }}" = "25" ]; then
-            echo "bootver=24" >> "$GITHUB_OUTPUT"
-          else
-            echo "bootver=23" >> "$GITHUB_OUTPUT"
-          fi
+          # Boot JDK == target version so its x86 jlink matches the target jmods
+          # (jlink from N can only link version-N modules) and can boot-build N.
+          echo "bootver=${{ matrix.version }}" >> "$GITHUB_OUTPUT"
 
       - name: Set up boot JDK (Temurin ${{ steps.boot.outputs.bootver }})
         uses: actions/setup-java@v4
@@ -60,9 +58,10 @@ jobs:
           set -e
           chmod +x *.sh android-wrapped-clang android-wrapped-clang++ || true
 
-          # 1) Point boot JDK at the one we installed (was a self-hosted-runner path)
-          sed -i "s#--with-boot-jdk=/home/compiler[^ ]*#--with-boot-jdk=${BOOT_JDK}#" 6_buildjdk.sh
-          echo "boot-jdk line now:"; grep -n 'with-boot-jdk' 6_buildjdk.sh
+          # 1) Replace the hardcoded self-hosted-runner boot JDK path in ALL scripts
+          #    (used by 6_buildjdk.sh --with-boot-jdk AND 7_removejdkdebuginfo.sh jlink)
+          sed -i "s#/home/compiler/actions-runner/_work/_tool/Java_Temurin-Hotspot_jdk/23.0.2-7/x64#${BOOT_JDK}#g" *.sh
+          echo "boot refs now:"; grep -n 'with-boot-jdk\|bin/jlink' 6_buildjdk.sh 7_removejdkdebuginfo.sh || true
 
           # 2) Make patch application non-fatal so ALL rejects are collected (diagnostics)
           sed -i 's#(echo "git apply failed (Android patch set)" && exit 1)#echo "PATCH_REJECTED: {}"#' 6_buildjdk.sh
@@ -75,6 +74,14 @@ jobs:
           # 4) For 25: retarget the JDK 24 clone case to JDK 25 and seed the patch dir
           if [ "${{ matrix.version }}" = "25" ]; then
             sed -i 's/jdk-24+20/jdk-25+36/; s/TARGET_VERSION -eq 24/TARGET_VERSION -eq 25/' 5_clonejdk.sh
+            # After cloning, strip GCC-only flag clang rejects, and COMMIT it inside the
+            # openjdk clone so 6_buildjdk.sh's `git reset --hard` keeps the change.
+            {
+              echo 'cd openjdk'
+              echo 'grep -rl "fno-lifetime-dse" make 2>/dev/null | xargs -r sed -i "s/-fno-lifetime-dse//g" || true'
+              echo 'git -c user.email=b@b.c -c user.name=b commit -am "strip -fno-lifetime-dse for clang cross-build" || true'
+              echo 'cd ..'
+            } >> 5_clonejdk.sh
             echo "5_clonejdk.sh (25):"; cat 5_clonejdk.sh
             cp -r patches/jre_24 patches/jre_25
             echo "patches/jre_25 seeded from jre_24:"; ls patches/jre_25/android | head -50
