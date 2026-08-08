@@ -1,0 +1,120 @@
+name: Build JDK Android (cloud GHA)
+
+on:
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: 'JSON array of JDK versions to build'
+        required: false
+        default: '[24, 25]'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(github.event.inputs.versions) }}
+    name: "Build JDK ${{ matrix.version }} aarch64-android"
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          echo "Before:"; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/local/graalvm /usr/local/share/powershell /usr/share/swift || true
+          sudo docker image prune --all --force || true
+          echo "After:"; df -h /
+
+      - name: Choose boot JDK version
+        id: boot
+        run: |
+          if [ "${{ matrix.version }}" = "25" ]; then
+            echo "bootver=24" >> "$GITHUB_OUTPUT"
+          else
+            echo "bootver=23" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up boot JDK (Temurin ${{ steps.boot.outputs.bootver }})
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.boot.outputs.bootver }}
+
+      - name: Record boot JDK path
+        run: echo "BOOT_JDK=$JAVA_HOME" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install cmake autoconf python3 python-is-python3 unzip zip \
+            systemtap-sdt-dev libxtst-dev libasound2-dev libelf-dev libfontconfig1-dev \
+            libx11-dev libxext-dev libxrandr-dev libxrender-dev libxt-dev wget file xz-utils
+
+      - name: Adapt harness for GHA + JDK ${{ matrix.version }}
+        run: |
+          set -e
+          chmod +x *.sh android-wrapped-clang android-wrapped-clang++ || true
+
+          # 1) Point boot JDK at the one we installed (was a self-hosted-runner path)
+          sed -i "s#--with-boot-jdk=/home/compiler[^ ]*#--with-boot-jdk=${BOOT_JDK}#" 6_buildjdk.sh
+          echo "boot-jdk line now:"; grep -n 'with-boot-jdk' 6_buildjdk.sh
+
+          # 2) Make patch application non-fatal so ALL rejects are collected (diagnostics)
+          sed -i 's#(echo "git apply failed (Android patch set)" && exit 1)#echo "PATCH_REJECTED: {}"#' 6_buildjdk.sh
+          grep -n 'PATCH_REJECTED' 6_buildjdk.sh || true
+
+          # 3) Extend the "--build=x86_64..." configure arg gate to also cover 25
+          sed -i 's/\$TARGET_VERSION -eq 24 \]\]; then/$TARGET_VERSION -eq 24 || $TARGET_VERSION -eq 25 ]]; then/' 6_buildjdk.sh
+          grep -n 'build=x86_64' -n 6_buildjdk.sh || true
+
+          # 4) For 25: retarget the JDK 24 clone case to JDK 25 and seed the patch dir
+          if [ "${{ matrix.version }}" = "25" ]; then
+            sed -i 's/jdk-24+20/jdk-25+36/; s/TARGET_VERSION -eq 24/TARGET_VERSION -eq 25/' 5_clonejdk.sh
+            echo "5_clonejdk.sh (25):"; cat 5_clonejdk.sh
+            cp -r patches/jre_24 patches/jre_25
+            echo "patches/jre_25 seeded from jre_24:"; ls patches/jre_25/android | head -50
+          fi
+
+      - name: Build JDK ${{ matrix.version }} for aarch64-linux-android
+        id: build
+        run: |
+          export USER=$(whoami)
+          export TARGET_VERSION=${{ matrix.version }}
+          echo "Building JDK $TARGET_VERSION with boot JDK $BOOT_JDK"
+          bash 1_ci_build_arch_aarch64.sh
+
+      - name: Collect diagnostics (always)
+        if: always()
+        run: |
+          mkdir -p _diag
+          # configure log(s)
+          find openjdk -name config.log -exec cp --parents {} _diag/ \; 2>/dev/null || true
+          # patch rejects
+          find openjdk -name '*.rej' -exec cp --parents {} _diag/ \; 2>/dev/null || true
+          # produced tarballs
+          ls -la *.tar.xz 2>/dev/null || echo "no tarball produced"
+          # verify java binary arch if built
+          JB=$(find openjdk -path '*/images/jdk/bin/java' | head -1)
+          if [ -n "$JB" ]; then
+            echo "=== file $JB ==="; file "$JB" | tee _diag/java.file.txt
+            RF=$(dirname "$JB")/../release
+            [ -f "$RF" ] && { echo "=== release ==="; cat "$RF" | tee _diag/release.txt; }
+          fi
+          echo "rej count: $(find openjdk -name '*.rej' 2>/dev/null | wc -l)"
+          df -h /
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "jdk${{ matrix.version }}-aarch64-android"
+          path: |
+            *.tar.xz
+            _diag/**
+          if-no-files-found: warn
+          retention-days: 14
