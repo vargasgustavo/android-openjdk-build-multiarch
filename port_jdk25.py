@@ -91,6 +91,47 @@ if os.path.exists(TLS):
 else:
     print(f"PORT: MISSING {TLS}", flush=True)
 
+# 3) libtinyiconv wiring - Bionic's libc gains iconv_open/iconv/iconv_close only at
+#    API >= 28; this build targets API 21, so libc exports no iconv symbols. JDK 25
+#    upstream added $(ICONV_*) to the instrument/jdwp libs, but on Android those
+#    resolve to empty, so libjdwp/libinstrument (which call iconv_*) fail to LINK
+#    with "undefined reference to iconv_open". The Bionic patch ships its own
+#    src/java.base/*/native/libtinyiconv/iconv.cpp; wire it into both libraries via
+#    EXTRA_SRC (+ CXXFLAGS, because it is C++). These two .gmk hunks reject on JDK 25
+#    from context drift, so re-apply them against the real JDK 25 text here.
+def wire_libtinyiconv(path, name_line):
+    if not os.path.exists(path):
+        print(f"PORT: MISSING {path} (skip libtinyiconv)", flush=True)
+        return
+    s = read(path)
+    if "java.base:libtinyiconv" in s:
+        print(f"PORT: {path}: libtinyiconv already wired", flush=True)
+        return
+    anchor = "    " + name_line + ", \\\n"
+    cnt = s.count(anchor)
+    if cnt != 1:
+        print(f"PORT: {path}: anchor '{name_line}' count={cnt} - ABORT", flush=True)
+        sys.exit(2)
+    ins = anchor + "    EXTRA_SRC := java.base:libtinyiconv, \\\n" \
+                 + "    CXXFLAGS := $(CXXFLAGS_JDKLIB), \\\n"
+    write(path, s.replace(anchor, ins, 1))
+    print(f"PORT: {path}: EXTRA_SRC libtinyiconv + CXXFLAGS wired", flush=True)
+
+
+wire_libtinyiconv("make/modules/java.instrument/Lib.gmk", "NAME := instrument")
+wire_libtinyiconv("make/modules/jdk.jdwp.agent/Lib.gmk", "NAME := jdwp")
+
+# 4) Disable the Serviceability Agent native lib (libsaproc). Its sources use
+#    thread_db/ptrace internals that do not exist on Bionic, so the Android patch
+#    comments out its build target. That one-line hunk rejects on JDK 25 (the tail
+#    of the file drifted), which would re-enable libsaproc and break the JDK build
+#    phase. Re-apply it here. SA/jhsdb is irrelevant to a Quest Minecraft runtime.
+replace_once(
+    "make/modules/jdk.hotspot.agent/Lib.gmk", "disable-libsaproc",
+    "\nTARGETS += $(BUILD_LIBSAPROC)\n",
+    "\n# TARGETS += $(BUILD_LIBSAPROC)\n",
+)
+
 if CHANGED:
     print("PORT: files written: " + ", ".join(sorted(set(CHANGED))), flush=True)
 print("PORT: done", flush=True)
