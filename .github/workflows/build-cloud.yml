@@ -30,18 +30,30 @@ jobs:
           sudo docker image prune --all --force || true
           echo "After:"; df -h /
 
-      - name: Choose boot JDK version
-        id: boot
+      - name: Compute JDK versions
+        id: vers
         run: |
-          # Boot JDK == target version so its x86 jlink matches the target jmods
-          # (jlink from N can only link version-N modules) and can boot-build N.
-          echo "bootver=${{ matrix.version }}" >> "$GITHUB_OUTPUT"
+          # Build with boot JDK N-1: boot==target trips 'bad requires flag:
+          # ACC_TRANSITIVE' in buildtools-jdk. The jlink in step 7 must instead be
+          # the TARGET version N, because jlink is version-locked to the jmods it
+          # links (it builds the jreout runtime image, the primary deliverable).
+          echo "jlinkver=${{ matrix.version }}" >> "$GITHUB_OUTPUT"
+          echo "bootver=$(( ${{ matrix.version }} - 1 ))" >> "$GITHUB_OUTPUT"
 
-      - name: Set up boot JDK (Temurin ${{ steps.boot.outputs.bootver }})
+      - name: Set up jlink JDK (target Temurin ${{ steps.vers.outputs.jlinkver }})
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ steps.boot.outputs.bootver }}
+          java-version: ${{ steps.vers.outputs.jlinkver }}
+
+      - name: Record jlink JDK path
+        run: echo "JLINK_JDK=$JAVA_HOME" >> "$GITHUB_ENV"
+
+      - name: Set up boot JDK (Temurin ${{ steps.vers.outputs.bootver }})
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.vers.outputs.bootver }}
 
       - name: Record boot JDK path
         run: echo "BOOT_JDK=$JAVA_HOME" >> "$GITHUB_ENV"
@@ -58,10 +70,14 @@ jobs:
           set -e
           chmod +x *.sh android-wrapped-clang android-wrapped-clang++ || true
 
-          # 1) Replace the hardcoded self-hosted-runner boot JDK path in ALL scripts
-          #    (used by 6_buildjdk.sh --with-boot-jdk AND 7_removejdkdebuginfo.sh jlink)
-          sed -i "s#/home/compiler/actions-runner/_work/_tool/Java_Temurin-Hotspot_jdk/23.0.2-7/x64#${BOOT_JDK}#g" *.sh
-          echo "boot refs now:"; grep -n 'with-boot-jdk\|bin/jlink' 6_buildjdk.sh 7_removejdkdebuginfo.sh || true
+          # 1) Replace the hardcoded self-hosted-runner JDK path:
+          #    6_buildjdk.sh --with-boot-jdk -> boot JDK (N-1)
+          #    7_removejdkdebuginfo.sh jlink -> jlink JDK (target N, version-locked)
+          HARDCODED="/home/compiler/actions-runner/_work/_tool/Java_Temurin-Hotspot_jdk/23.0.2-7/x64"
+          sed -i "s#${HARDCODED}#${BOOT_JDK}#g" 6_buildjdk.sh
+          sed -i "s#${HARDCODED}#${JLINK_JDK}#g" 7_removejdkdebuginfo.sh
+          echo "boot ref (6):"; grep -n 'with-boot-jdk' 6_buildjdk.sh || true
+          echo "jlink ref (7):"; grep -n 'bin/jlink' 7_removejdkdebuginfo.sh || true
 
           # 2) Make patch application non-fatal so ALL rejects are collected (diagnostics)
           sed -i 's#(echo "git apply failed (Android patch set)" && exit 1)#echo "PATCH_REJECTED: {}"#' 6_buildjdk.sh
@@ -85,6 +101,11 @@ jobs:
             echo "5_clonejdk.sh (25):"; cat 5_clonejdk.sh
             cp -r patches/jre_24 patches/jre_25
             echo "patches/jre_25 seeded from jre_24:"; ls patches/jre_25/android | head -50
+            # Port the compile-blocking Bionic hunks that reject on JDK 25 source
+            # (dlvsym shim + threadLS #endif). Injected to run after the patch-apply
+            # loop and just before ./configure, with cwd=openjdk.
+            sed -i '\#^bash \./configure#i python3 ../port_jdk25.py || exit 1' 6_buildjdk.sh
+            echo "port injection (6):"; grep -n 'port_jdk25' 6_buildjdk.sh || true
           fi
 
       - name: Build JDK ${{ matrix.version }} for aarch64-linux-android
